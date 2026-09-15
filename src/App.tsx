@@ -1,10 +1,14 @@
 import { useMemo, useState } from 'react'
 import { UcumLhcUtils, type UcumMessage } from '@lhncbc/ucum-lhc'
 import { analyteCategories, analytes, type Analyte, type UnitOption } from './data'
+import { convertSpecial, hasSpecialConversion, specialAnalytes } from './specialConversions'
 import './styles.css'
+import './special.css'
 
 const ucum = UcumLhcUtils.getInstance()
 const CUSTOM_UNIT = '__custom__'
+const allAnalytes: Analyte[] = [...analytes, ...specialAnalytes]
+const allCategories = Array.from(new Set([...analyteCategories, ...specialAnalytes.map((item) => item.category)]))
 
 function msgText(message: UcumMessage): string {
   const text = typeof message === 'string' ? message : (message.message ?? message.msg ?? '')
@@ -26,11 +30,12 @@ type UnitPickerProps = {
   units: UnitOption[]
   value: string
   custom: boolean
+  allowCustom: boolean
   onValue: (value: string) => void
   onCustom: (custom: boolean) => void
 }
 
-function UnitPicker({ label, units, value, custom, onValue, onCustom }: UnitPickerProps) {
+function UnitPicker({ label, units, value, custom, allowCustom, onValue, onCustom }: UnitPickerProps) {
   return (
     <label className="input-group unit-picker">
       <span>{label}</span>
@@ -49,9 +54,9 @@ function UnitPicker({ label, units, value, custom, onValue, onCustom }: UnitPick
         {units.map((unit) => (
           <option key={unit.code} value={unit.code}>{unit.label}</option>
         ))}
-        <option value={CUSTOM_UNIT}>Custom UCUM…</option>
+        {allowCustom ? <option value={CUSTOM_UNIT}>Custom UCUM…</option> : null}
       </select>
-      {custom ? (
+      {allowCustom && custom ? (
         <input
           className="field custom-unit"
           value={value}
@@ -66,7 +71,8 @@ function UnitPicker({ label, units, value, custom, onValue, onCustom }: UnitPick
 
 export default function App() {
   const [analyteId, setAnalyteId] = useState('glucose')
-  const analyte = analytes.find((x) => x.id === analyteId) ?? analytes[0]
+  const analyte = allAnalytes.find((x) => x.id === analyteId) ?? allAnalytes[0]
+  const isSpecial = hasSpecialConversion(analyte.id)
   const [value, setValue] = useState('100')
   const [fromUnit, setFromUnit] = useState(analyte.defaultFrom)
   const [toUnit, setToUnit] = useState(analyte.defaultTo)
@@ -77,6 +83,27 @@ export default function App() {
     const number = Number(value)
     if (!Number.isFinite(number)) return { kind: 'empty' as const }
     if (!fromUnit.trim() || !toUnit.trim()) return { kind: 'empty' as const }
+
+    if (hasSpecialConversion(analyte.id)) {
+      const converted = convertSpecial(analyte.id, number, fromUnit.trim(), toUnit.trim())
+      if (!converted) {
+        return {
+          kind: 'error' as const,
+          message: 'This analyte uses an explicit clinical conversion rule. Choose one of the listed reporting units.',
+        }
+      }
+      return {
+        kind: 'success' as const,
+        mode: 'special' as const,
+        value: converted.value,
+        fromCode: fromUnit,
+        toCode: toUnit,
+        formula: converted.formula,
+        sourceName: converted.sourceName,
+        sourceUrl: converted.sourceUrl,
+        note: converted.note,
+      }
+    }
 
     const from = ucum.validateUnitString(fromUnit.trim(), true)
     const to = ucum.validateUnitString(toUnit.trim(), true)
@@ -100,6 +127,7 @@ export default function App() {
 
     return {
       kind: 'success' as const,
+      mode: 'ucum' as const,
       value: converted.toVal,
       fromCode: from.ucumCode ?? fromUnit,
       toCode: to.ucumCode ?? toUnit,
@@ -107,7 +135,7 @@ export default function App() {
   }, [analyte, value, fromUnit, toUnit])
 
   const chooseAnalyte = (id: string) => {
-    const next = analytes.find((x) => x.id === id)
+    const next = allAnalytes.find((x) => x.id === id)
     if (!next) return
     setAnalyteId(id)
     setFromUnit(next.defaultFrom)
@@ -137,11 +165,12 @@ export default function App() {
 
       <main>
         <section className="hero">
-          <div className="eyebrow">UCUM-powered · analyte-aware</div>
+          <div className="eyebrow">UCUM-powered · explicit special rules</div>
           <h1>Laboratory unit conversion with clinically relevant unit choices.</h1>
           <p>
-            Each analyte now exposes the units commonly encountered in laboratory reporting.
-            You can still enter any valid UCUM expression through the custom-unit option.
+            Standard conversions use UCUM. Convention-based conversions such as BUN, triglycerides,
+            HbA1c and urine creatinine ratios use separate published formulas instead of pretending
+            they are ordinary dimensional conversions.
           </p>
         </section>
 
@@ -149,13 +178,13 @@ export default function App() {
           <div className="panel converter-panel">
             <div className="section-heading">
               <div><span className="step">1</span><h2>Select analyte</h2></div>
-              <span className="badge">{analyte.category}</span>
+              <span className={`badge ${isSpecial ? 'special-badge' : ''}`}>{isSpecial ? 'Published formula' : analyte.category}</span>
             </div>
 
             <select className="field analyte-select" value={analyteId} onChange={(e) => chooseAnalyte(e.target.value)}>
-              {analyteCategories.map((category) => (
+              {allCategories.map((category) => (
                 <optgroup key={category} label={category}>
-                  {analytes.filter((item) => item.category === category).map((item) => (
+                  {allAnalytes.filter((item) => item.category === category).map((item) => (
                     <option key={item.id} value={item.id}>{item.name}</option>
                   ))}
                 </optgroup>
@@ -163,7 +192,7 @@ export default function App() {
             </select>
 
             <div className="analyte-meta">
-              {analyte.molecularWeight ? <span>MW {analyte.molecularWeight} g/mol</span> : <span>No molecular conversion</span>}
+              {isSpecial ? <span>Explicit conversion rule</span> : analyte.molecularWeight ? <span>MW {analyte.molecularWeight} g/mol</span> : <span>No molecular conversion</span>}
               {analyte.charge ? <span>|charge| {analyte.charge}</span> : null}
             </div>
 
@@ -186,6 +215,7 @@ export default function App() {
                 units={analyte.commonUnits}
                 value={fromUnit}
                 custom={fromCustom}
+                allowCustom={!isSpecial}
                 onValue={setFromUnit}
                 onCustom={setFromCustom}
               />
@@ -197,11 +227,16 @@ export default function App() {
                 units={analyte.commonUnits}
                 value={toUnit}
                 custom={toCustom}
+                allowCustom={!isSpecial}
                 onValue={setToUnit}
                 onCustom={setToCustom}
               />
             </div>
-            <p className="unit-hint">The dropdown shows analyte-specific common units. Choose Custom UCUM for any other valid UCUM expression.</p>
+            <p className="unit-hint">
+              {isSpecial
+                ? 'This analyte uses a published conversion formula, so only the validated reporting-unit pair is offered.'
+                : 'The dropdown shows analyte-specific common units. Choose Custom UCUM for any other valid UCUM expression.'}
+            </p>
           </div>
 
           <aside className={`panel result-panel ${result.kind}`}>
@@ -210,21 +245,32 @@ export default function App() {
               <div className="result-value">{pretty(result.value)}</div>
               <div className="result-unit">{unitLabel(analyte, toUnit)}</div>
               <div className="equation">{value} {unitLabel(analyte, fromUnit)} = {pretty(result.value)} {unitLabel(analyte, toUnit)}</div>
-              <div className="verified-box"><strong>UCUM validated</strong><span>{result.fromCode} → {result.toCode}</span></div>
+
+              {result.mode === 'special' ? (
+                <div className="formula-box">
+                  <strong>Published conversion rule</strong>
+                  <code>{result.formula}</code>
+                  <a href={result.sourceUrl} target="_blank" rel="noreferrer">Source: {result.sourceName} ↗</a>
+                </div>
+              ) : (
+                <div className="verified-box"><strong>UCUM validated</strong><span>{result.fromCode} → {result.toCode}</span></div>
+              )}
+
+              {result.mode === 'special' && result.note ? <p className="rule-note">{result.note}</p> : null}
             </> : result.kind === 'error' ? <div className="error-box"><strong>Conversion unavailable</strong><p>{result.message}</p></div> : <div className="empty-state">Enter a numeric value and valid units to calculate.</div>}
             {analyte.note ? <p className="clinical-note">{analyte.note}</p> : null}
           </aside>
         </section>
 
         <section className="principles">
-          <div><strong>Analyte-specific units</strong><span>Glucose, CBC, blood gas, enzymes and hormones no longer share one generic unit list.</span></div>
-          <div><strong>UCUM first</strong><span>Machine-readable UCUM codes are kept separate from human-friendly display labels such as µmol/L or mmHg.</span></div>
-          <div><strong>Exceptions stay explicit</strong><span>HbA1c NGSP↔IFCC, D-dimer FEU↔DDU, BUN and similar convention-based conversions are not guessed from dimensional units.</span></div>
+          <div><strong>UCUM when appropriate</strong><span>Ordinary unit scaling and dimensional conversions remain on the NLM UCUM engine.</span></div>
+          <div><strong>Published special rules</strong><span>BUN, triglycerides, HbA1c and urine creatinine ratios are routed through explicit formulas with visible sources.</span></div>
+          <div><strong>No silent guessing</strong><span>D-dimer FEU↔DDU and other assay-dependent conventions stay excluded until a clearly scoped rule is added.</span></div>
         </section>
 
         <section className="notice"><strong>Clinical-use note.</strong> This is an engineering prototype. Independently validate conversion results before use in reporting or patient care. Reference intervals remain separate because they are method-, population-, age-, and sex-dependent.</section>
       </main>
-      <footer>LabTools v0.2 · UCUM engine by NLM LHC · Open source</footer>
+      <footer>LabTools v0.3 · UCUM + explicit clinical conversion rules · Open source</footer>
     </div>
   )
 }
