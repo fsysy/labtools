@@ -9,7 +9,9 @@ import {
   findReferenceInterval,
   hasReferenceIntervals,
   needsSex,
+  needsSpecimen,
   type BiologicalSex,
+  type SpecimenChoice,
 } from './referenceRanges'
 import './styles.css'
 import './special.css'
@@ -19,6 +21,8 @@ const ucum = UcumLhcUtils.getInstance()
 const CUSTOM_UNIT = '__custom__'
 const allAnalytes: Analyte[] = [...analytes, ...specialAnalytes]
 const allCategories = Array.from(new Set([...analyteCategories, ...specialAnalytes.map((item) => item.category)]))
+
+type AgeUnit = 'days' | 'weeks' | 'months' | 'years'
 
 function msgText(message: UcumMessage): string {
   const text = typeof message === 'string' ? message : (message.message ?? message.msg ?? '')
@@ -33,6 +37,31 @@ function pretty(value: number): string {
 
 function unitLabel(analyte: Analyte, code: string): string {
   return analyte.commonUnits.find((unit) => unit.code === code)?.label ?? code
+}
+
+function ageToDays(value: string, unit: AgeUnit): number {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return Number.NaN
+  const multiplier = unit === 'days' ? 1 : unit === 'weeks' ? 7 : unit === 'months' ? 365.25 / 12 : 365.25
+  return Math.floor(n * multiplier)
+}
+
+function matchesAnalyte(analyte: Analyte, query: string): boolean {
+  const q = query.trim().toLowerCase()
+  if (!q) return true
+  const haystack = [analyte.name, analyte.id, analyte.category, ...analyte.aliases].join(' ').toLowerCase()
+  return haystack.includes(q)
+}
+
+function analyteScore(analyte: Analyte, query: string): number {
+  const q = query.trim().toLowerCase()
+  if (!q) return 0
+  const name = analyte.name.toLowerCase()
+  const id = analyte.id.toLowerCase()
+  const aliases = analyte.aliases.map((alias) => alias.toLowerCase())
+  if (name === q || id === q || aliases.includes(q)) return 0
+  if (name.startsWith(q) || id.startsWith(q) || aliases.some((alias) => alias.startsWith(q))) return 1
+  return 2
 }
 
 type UnitPickerProps = {
@@ -85,13 +114,28 @@ export default function App() {
   const isSpecial = hasSpecialConversion(analyte.id)
   const hasReference = hasReferenceIntervals(analyte.id)
 
+  const [searchQuery, setSearchQuery] = useState('')
   const [value, setValue] = useState('100')
   const [fromUnit, setFromUnit] = useState(analyte.defaultFrom)
   const [toUnit, setToUnit] = useState(analyte.defaultTo)
   const [fromCustom, setFromCustom] = useState(false)
   const [toCustom, setToCustom] = useState(false)
-  const [ageYears, setAgeYears] = useState('45')
+  const [ageValue, setAgeValue] = useState('45')
+  const [ageUnit, setAgeUnit] = useState<AgeUnit>('years')
   const [sex, setSex] = useState<BiologicalSex>('unspecified')
+  const [specimen, setSpecimen] = useState<SpecimenChoice>('unspecified')
+
+  const ageDays = useMemo(() => ageToDays(ageValue, ageUnit), [ageValue, ageUnit])
+  const requiresSex = hasReference && Number.isFinite(ageDays) ? needsSex(analyte.id, ageDays) : false
+  const requiresSpecimen = hasReference && Number.isFinite(ageDays) ? needsSpecimen(analyte.id, ageDays) : false
+
+  const searchResults = useMemo(() => {
+    if (!searchQuery.trim()) return []
+    return allAnalytes
+      .filter((item) => matchesAnalyte(item, searchQuery))
+      .sort((a, b) => analyteScore(a, searchQuery) - analyteScore(b, searchQuery) || a.name.localeCompare(b.name))
+      .slice(0, 10)
+  }, [searchQuery])
 
   const result = useMemo(() => {
     const number = Number(value)
@@ -150,17 +194,15 @@ export default function App() {
 
   const referenceView = useMemo(() => {
     if (!hasReference) return { kind: 'none' as const }
+    if (!Number.isFinite(ageDays) || ageDays < 0) return { kind: 'invalid-age' as const }
+    if (needsSex(analyte.id, ageDays) && sex === 'unspecified') return { kind: 'needs-sex' as const }
+    if (needsSpecimen(analyte.id, ageDays) && specimen === 'unspecified') return { kind: 'needs-specimen' as const }
 
-    const age = Number(ageYears)
-    if (!Number.isFinite(age) || age < 0) return { kind: 'invalid-age' as const }
-    if (needsSex(analyte.id, age) && sex === 'unspecified') return { kind: 'needs-sex' as const }
-
-    const interval = findReferenceInterval(analyte.id, age, sex)
+    const interval = findReferenceInterval(analyte.id, ageDays, sex, specimen)
     if (!interval) return { kind: 'no-match' as const }
 
     const converted = convertReferenceInterval(interval, analyte, toUnit.trim())
     if (!converted) return { kind: 'unit-error' as const, interval }
-
     if (result.kind !== 'success') return { kind: 'range-only' as const, range: converted }
 
     return {
@@ -168,7 +210,7 @@ export default function App() {
       range: converted,
       status: classifyAgainstRange(result.value, converted.displayLower, converted.displayUpper),
     }
-  }, [hasReference, ageYears, sex, analyte, toUnit, result])
+  }, [hasReference, ageDays, sex, specimen, analyte, toUnit, result])
 
   const chooseAnalyte = (id: string) => {
     const next = allAnalytes.find((x) => x.id === id)
@@ -178,6 +220,8 @@ export default function App() {
     setToUnit(next.defaultTo)
     setFromCustom(false)
     setToCustom(false)
+    setSearchQuery('')
+    setSpecimen('unspecified')
   }
 
   const swap = () => {
@@ -190,15 +234,17 @@ export default function App() {
 
   const renderReferenceCard = () => {
     if (referenceView.kind === 'none') return null
-
     if (referenceView.kind === 'invalid-age') {
-      return <div className="reference-empty"><strong>Reference interval unavailable</strong>Enter a valid age in years.</div>
+      return <div className="reference-empty"><strong>Reference interval unavailable</strong>Enter a valid non-negative age.</div>
     }
     if (referenceView.kind === 'needs-sex') {
-      return <div className="reference-empty"><strong>Sex-specific interval</strong>Select male or female to apply the RCPA interval for this analyte and age.</div>
+      return <div className="reference-empty"><strong>Sex-specific interval</strong>Select male or female for this RCPA age partition.</div>
+    }
+    if (referenceView.kind === 'needs-specimen') {
+      return <div className="reference-empty"><strong>Specimen-specific interval</strong>RCPA publishes different paediatric potassium intervals for serum and plasma. Select the specimen before classification.</div>
     }
     if (referenceView.kind === 'no-match') {
-      return <div className="reference-empty"><strong>No interval in the current adult seed</strong>The selected age/sex falls outside the RCPA interval currently encoded in LabTools. The app does not extrapolate.</div>
+      return <div className="reference-empty"><strong>No matching RCPA interval encoded</strong>The selected age/sex/specimen falls outside the interval currently encoded in LabTools. The app does not extrapolate.</div>
     }
     if (referenceView.kind === 'unit-error') {
       return <div className="reference-empty"><strong>Reference interval found, but not convertible</strong>The published RCPA interval is {pretty(referenceView.interval.lower)}–{pretty(referenceView.interval.upper)} {referenceView.interval.unit}. Choose a compatible reporting unit to compare the result.</div>
@@ -219,9 +265,10 @@ export default function App() {
         </div>
 
         <div className="reference-meta">
-          <div><span>Population</span><strong>{range.ageMinYears} to &lt;{range.ageMaxYears} years{range.sex !== 'any' ? ` · ${range.sex}` : ''}</strong></div>
+          <div><span>Population</span><strong>{range.ageLabel}{range.sex !== 'any' ? ` · ${range.sex}` : ''}</strong></div>
           <div><span>Specimen</span><strong>{range.specimen}</strong></div>
           <div><span>Published unit</span><strong>{pretty(range.lower)}–{pretty(range.upper)} {range.unit}</strong></div>
+          {range.loinc ? <div><span>RCPA LOINC</span><strong>{range.loinc}</strong></div> : null}
         </div>
 
         {range.note ? <p className="reference-note">{range.note}</p> : null}
@@ -244,12 +291,11 @@ export default function App() {
 
       <main>
         <section className="hero">
-          <div className="eyebrow">UCUM-powered · source-aware reference intervals</div>
-          <h1>Laboratory unit conversion with reference intervals kept in context.</h1>
+          <div className="eyebrow">UCUM-powered · paediatric + adult RCPA intervals</div>
+          <h1>Search the analyte, convert the unit, keep the reference context.</h1>
           <p>
-            Standard conversions use UCUM, convention-based conversions use explicit published formulas,
-            and selected adult chemistry tests now show RCPA harmonised reference intervals with age, sex,
-            specimen and method limitations preserved.
+            Search by test name or common alias, convert with UCUM or an explicit published rule,
+            then compare against source-specific RCPA paediatric or adult harmonised intervals when available.
           </p>
         </section>
 
@@ -260,7 +306,33 @@ export default function App() {
               <span className={`badge ${isSpecial ? 'special-badge' : ''}`}>{isSpecial ? 'Published formula' : analyte.category}</span>
             </div>
 
-            <select className="field analyte-select" value={analyteId} onChange={(e) => chooseAnalyte(e.target.value)}>
+            <div className="analyte-search">
+              <input
+                className="field"
+                type="search"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && searchResults[0]) chooseAnalyte(searchResults[0].id)
+                  if (e.key === 'Escape') setSearchQuery('')
+                }}
+                placeholder="Search name or alias — e.g. Cr, CREA, AST, HDL"
+                aria-label="Search analytes by name or alias"
+              />
+              {searchQuery.trim() ? (
+                <div className="analyte-search-results" role="listbox" aria-label="Analyte search results">
+                  {searchResults.length ? searchResults.map((item) => (
+                    <button key={item.id} type="button" onClick={() => chooseAnalyte(item.id)}>
+                      <span><strong>{item.name}</strong><small>{item.category}</small></span>
+                      <em>{item.aliases.slice(0, 4).join(' · ') || item.id}</em>
+                    </button>
+                  )) : <div className="search-no-result">No analyte matched “{searchQuery}”.</div>}
+                </div>
+              ) : null}
+            </div>
+
+            <label className="browse-label" htmlFor="analyte-select">Or browse by category</label>
+            <select id="analyte-select" className="field analyte-select" value={analyteId} onChange={(e) => chooseAnalyte(e.target.value)}>
               {allCategories.map((category) => (
                 <optgroup key={category} label={category}>
                   {allAnalytes.filter((item) => item.category === category).map((item) => (
@@ -273,14 +345,12 @@ export default function App() {
             <div className="analyte-meta">
               {isSpecial ? <span>Explicit conversion rule</span> : analyte.molecularWeight ? <span>MW {analyte.molecularWeight} g/mol</span> : <span>No molecular conversion</span>}
               {analyte.charge ? <span>|charge| {analyte.charge}</span> : null}
-              {hasReference ? <span>RCPA adult RI available</span> : null}
+              {hasReference ? <span>RCPA RI available</span> : null}
             </div>
 
             <div className="common-unit-strip" aria-label="Common units for selected analyte">
               <strong>Common units</strong>
-              <div>
-                {analyte.commonUnits.map((unit) => <span key={unit.code}>{unit.label}</span>)}
-              </div>
+              <div>{analyte.commonUnits.map((unit) => <span key={unit.code}>{unit.label}</span>)}</div>
             </div>
 
             <div className="section-heading value-heading"><div><span className="step">2</span><h2>Enter value & units</h2></div></div>
@@ -290,27 +360,9 @@ export default function App() {
                 <input className="field numeric" inputMode="decimal" value={value} onChange={(e) => setValue(e.target.value)} />
               </label>
 
-              <UnitPicker
-                label="From"
-                units={analyte.commonUnits}
-                value={fromUnit}
-                custom={fromCustom}
-                allowCustom={!isSpecial}
-                onValue={setFromUnit}
-                onCustom={setFromCustom}
-              />
-
+              <UnitPicker label="From" units={analyte.commonUnits} value={fromUnit} custom={fromCustom} allowCustom={!isSpecial} onValue={setFromUnit} onCustom={setFromCustom} />
               <button className="swap" type="button" onClick={swap} aria-label="Swap units">⇄</button>
-
-              <UnitPicker
-                label="To"
-                units={analyte.commonUnits}
-                value={toUnit}
-                custom={toCustom}
-                allowCustom={!isSpecial}
-                onValue={setToUnit}
-                onCustom={setToCustom}
-              />
+              <UnitPicker label="To" units={analyte.commonUnits} value={toUnit} custom={toCustom} allowCustom={!isSpecial} onValue={setToUnit} onCustom={setToCustom} />
             </div>
             <p className="unit-hint">
               {isSpecial
@@ -322,23 +374,46 @@ export default function App() {
               <div className="reference-context">
                 <div className="section-heading">
                   <div><span className="step">3</span><h2>Reference context</h2></div>
-                  <span className="badge">RCPA adult seed</span>
+                  <span className="badge">RCPA paediatric + adult</span>
                 </div>
-                <div className="reference-fields">
+
+                <div className="reference-fields reference-fields-age">
                   <label className="input-group">
-                    <span>Age (years)</span>
-                    <input className="field" inputMode="decimal" value={ageYears} onChange={(e) => setAgeYears(e.target.value)} />
+                    <span>Age</span>
+                    <input className="field" inputMode="decimal" value={ageValue} onChange={(e) => setAgeValue(e.target.value)} />
                   </label>
                   <label className="input-group">
-                    <span>Sex</span>
+                    <span>Age unit</span>
+                    <select className="field" value={ageUnit} onChange={(e) => setAgeUnit(e.target.value as AgeUnit)}>
+                      <option value="days">Days</option>
+                      <option value="weeks">Weeks</option>
+                      <option value="months">Months</option>
+                      <option value="years">Years</option>
+                    </select>
+                  </label>
+                  <label className="input-group">
+                    <span>Sex {requiresSex ? '· required' : ''}</span>
                     <select className="field" value={sex} onChange={(e) => setSex(e.target.value as BiologicalSex)}>
                       <option value="unspecified">Not specified</option>
                       <option value="male">Male</option>
                       <option value="female">Female</option>
                     </select>
                   </label>
+                  {requiresSpecimen ? (
+                    <label className="input-group">
+                      <span>Specimen · required</span>
+                      <select className="field" value={specimen} onChange={(e) => setSpecimen(e.target.value as SpecimenChoice)}>
+                        <option value="unspecified">Select specimen</option>
+                        <option value="serum">Serum</option>
+                        <option value="plasma">Plasma</option>
+                      </select>
+                    </label>
+                  ) : null}
                 </div>
-                <p className="reference-help">Reference intervals are source-specific, not universal. LabTools will not extrapolate outside the encoded RCPA age/sex scope.</p>
+
+                <p className="reference-help">
+                  Age partitions are evaluated in days to preserve neonatal and paediatric boundaries. For a child close to a boundary, use days or weeks rather than an approximate month value. LabTools never extrapolates beyond the encoded RCPA scope.
+                </p>
               </div>
             ) : null}
           </div>
@@ -369,14 +444,14 @@ export default function App() {
         </section>
 
         <section className="principles">
-          <div><strong>Source-aware RI</strong><span>Reference intervals are stored with age, sex, specimen, method notes and source instead of being presented as universal normal ranges.</span></div>
-          <div><strong>Unit-aware comparison</strong><span>The published interval is converted into the selected output unit before Low / Within / High classification.</span></div>
-          <div><strong>No extrapolation</strong><span>If age, sex, method scope or analyte data do not match, LabTools shows no classification rather than inventing a range.</span></div>
+          <div><strong>Name + alias search</strong><span>Search matches the analyte name, internal id, category and aliases such as Cr, CREA, HDL or AST.</span></div>
+          <div><strong>Paediatric boundaries preserved</strong><span>Neonatal, weekly and childhood RCPA partitions are evaluated in days instead of flattening everything into adult years.</span></div>
+          <div><strong>Specimen-aware where needed</strong><span>Paediatric potassium requires serum vs plasma because RCPA publishes different intervals for those specimens.</span></div>
         </section>
 
         <section className="notice"><strong>Clinical-use note.</strong> This is an engineering prototype. RCPA harmonised intervals apply only in their published context and do not replace the reporting laboratory's validated reference interval. Independently validate both conversion and interval logic before use in reporting or patient care.</section>
       </main>
-      <footer>LabTools v0.4 · UCUM + published conversion rules + source-aware RCPA adult reference intervals · Open source</footer>
+      <footer>LabTools v0.5 · UCUM + published conversion rules + RCPA paediatric/adult reference intervals + alias search · Open source</footer>
     </div>
   )
 }
