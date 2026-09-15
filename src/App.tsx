@@ -2,8 +2,18 @@ import { useMemo, useState } from 'react'
 import { UcumLhcUtils, type UcumMessage } from '@lhncbc/ucum-lhc'
 import { analyteCategories, analytes, type Analyte, type UnitOption } from './data'
 import { convertSpecial, hasSpecialConversion, specialAnalytes } from './specialConversions'
+import {
+  RCPA_SOURCE,
+  classifyAgainstRange,
+  convertReferenceInterval,
+  findReferenceInterval,
+  hasReferenceIntervals,
+  needsSex,
+  type BiologicalSex,
+} from './referenceRanges'
 import './styles.css'
 import './special.css'
+import './reference.css'
 
 const ucum = UcumLhcUtils.getInstance()
 const CUSTOM_UNIT = '__custom__'
@@ -73,11 +83,15 @@ export default function App() {
   const [analyteId, setAnalyteId] = useState('glucose')
   const analyte = allAnalytes.find((x) => x.id === analyteId) ?? allAnalytes[0]
   const isSpecial = hasSpecialConversion(analyte.id)
+  const hasReference = hasReferenceIntervals(analyte.id)
+
   const [value, setValue] = useState('100')
   const [fromUnit, setFromUnit] = useState(analyte.defaultFrom)
   const [toUnit, setToUnit] = useState(analyte.defaultTo)
   const [fromCustom, setFromCustom] = useState(false)
   const [toCustom, setToCustom] = useState(false)
+  const [ageYears, setAgeYears] = useState('45')
+  const [sex, setSex] = useState<BiologicalSex>('unspecified')
 
   const result = useMemo(() => {
     const number = Number(value)
@@ -134,6 +148,28 @@ export default function App() {
     }
   }, [analyte, value, fromUnit, toUnit])
 
+  const referenceView = useMemo(() => {
+    if (!hasReference) return { kind: 'none' as const }
+
+    const age = Number(ageYears)
+    if (!Number.isFinite(age) || age < 0) return { kind: 'invalid-age' as const }
+    if (needsSex(analyte.id, age) && sex === 'unspecified') return { kind: 'needs-sex' as const }
+
+    const interval = findReferenceInterval(analyte.id, age, sex)
+    if (!interval) return { kind: 'no-match' as const }
+
+    const converted = convertReferenceInterval(interval, analyte, toUnit.trim())
+    if (!converted) return { kind: 'unit-error' as const, interval }
+
+    if (result.kind !== 'success') return { kind: 'range-only' as const, range: converted }
+
+    return {
+      kind: 'matched' as const,
+      range: converted,
+      status: classifyAgainstRange(result.value, converted.displayLower, converted.displayUpper),
+    }
+  }, [hasReference, ageYears, sex, analyte, toUnit, result])
+
   const chooseAnalyte = (id: string) => {
     const next = allAnalytes.find((x) => x.id === id)
     if (!next) return
@@ -152,6 +188,49 @@ export default function App() {
     if (result.kind === 'success') setValue(String(result.value))
   }
 
+  const renderReferenceCard = () => {
+    if (referenceView.kind === 'none') return null
+
+    if (referenceView.kind === 'invalid-age') {
+      return <div className="reference-empty"><strong>Reference interval unavailable</strong>Enter a valid age in years.</div>
+    }
+    if (referenceView.kind === 'needs-sex') {
+      return <div className="reference-empty"><strong>Sex-specific interval</strong>Select male or female to apply the RCPA interval for this analyte and age.</div>
+    }
+    if (referenceView.kind === 'no-match') {
+      return <div className="reference-empty"><strong>No interval in the current adult seed</strong>The selected age/sex falls outside the RCPA interval currently encoded in LabTools. The app does not extrapolate.</div>
+    }
+    if (referenceView.kind === 'unit-error') {
+      return <div className="reference-empty"><strong>Reference interval found, but not convertible</strong>The published RCPA interval is {pretty(referenceView.interval.lower)}–{pretty(referenceView.interval.upper)} {referenceView.interval.unit}. Choose a compatible reporting unit to compare the result.</div>
+    }
+
+    const range = referenceView.range
+    const status = referenceView.kind === 'matched' ? referenceView.status : null
+    const statusText = status === 'low' ? 'Low' : status === 'high' ? 'High' : status === 'within' ? 'Within' : null
+
+    return (
+      <div className="reference-card">
+        <div className="reference-card-header">
+          <div>
+            <span className="reference-kicker">RCPA harmonised reference interval</span>
+            <span className="reference-range">{pretty(range.displayLower)}–{pretty(range.displayUpper)} {unitLabel(analyte, range.displayUnit)}</span>
+          </div>
+          {status ? <span className={`range-status ${status}`}>{statusText}</span> : null}
+        </div>
+
+        <div className="reference-meta">
+          <div><span>Population</span><strong>{range.ageMinYears} to &lt;{range.ageMaxYears} years{range.sex !== 'any' ? ` · ${range.sex}` : ''}</strong></div>
+          <div><span>Specimen</span><strong>{range.specimen}</strong></div>
+          <div><span>Published unit</span><strong>{pretty(range.lower)}–{pretty(range.upper)} {range.unit}</strong></div>
+        </div>
+
+        {range.note ? <p className="reference-note">{range.note}</p> : null}
+        <a className="reference-source" href={RCPA_SOURCE.url} target="_blank" rel="noreferrer">Source: RCPA Table 6 ↗</a>
+        <div className="reference-scope">{RCPA_SOURCE.scope}</div>
+      </div>
+    )
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -165,12 +244,12 @@ export default function App() {
 
       <main>
         <section className="hero">
-          <div className="eyebrow">UCUM-powered · explicit special rules</div>
-          <h1>Laboratory unit conversion with clinically relevant unit choices.</h1>
+          <div className="eyebrow">UCUM-powered · source-aware reference intervals</div>
+          <h1>Laboratory unit conversion with reference intervals kept in context.</h1>
           <p>
-            Standard conversions use UCUM. Convention-based conversions such as BUN, triglycerides,
-            HbA1c and urine creatinine ratios use separate published formulas instead of pretending
-            they are ordinary dimensional conversions.
+            Standard conversions use UCUM, convention-based conversions use explicit published formulas,
+            and selected adult chemistry tests now show RCPA harmonised reference intervals with age, sex,
+            specimen and method limitations preserved.
           </p>
         </section>
 
@@ -194,6 +273,7 @@ export default function App() {
             <div className="analyte-meta">
               {isSpecial ? <span>Explicit conversion rule</span> : analyte.molecularWeight ? <span>MW {analyte.molecularWeight} g/mol</span> : <span>No molecular conversion</span>}
               {analyte.charge ? <span>|charge| {analyte.charge}</span> : null}
+              {hasReference ? <span>RCPA adult RI available</span> : null}
             </div>
 
             <div className="common-unit-strip" aria-label="Common units for selected analyte">
@@ -237,10 +317,34 @@ export default function App() {
                 ? 'This analyte uses a published conversion formula, so only the validated reporting-unit pair is offered.'
                 : 'The dropdown shows analyte-specific common units. Choose Custom UCUM for any other valid UCUM expression.'}
             </p>
+
+            {hasReference ? (
+              <div className="reference-context">
+                <div className="section-heading">
+                  <div><span className="step">3</span><h2>Reference context</h2></div>
+                  <span className="badge">RCPA adult seed</span>
+                </div>
+                <div className="reference-fields">
+                  <label className="input-group">
+                    <span>Age (years)</span>
+                    <input className="field" inputMode="decimal" value={ageYears} onChange={(e) => setAgeYears(e.target.value)} />
+                  </label>
+                  <label className="input-group">
+                    <span>Sex</span>
+                    <select className="field" value={sex} onChange={(e) => setSex(e.target.value as BiologicalSex)}>
+                      <option value="unspecified">Not specified</option>
+                      <option value="male">Male</option>
+                      <option value="female">Female</option>
+                    </select>
+                  </label>
+                </div>
+                <p className="reference-help">Reference intervals are source-specific, not universal. LabTools will not extrapolate outside the encoded RCPA age/sex scope.</p>
+              </div>
+            ) : null}
           </div>
 
           <aside className={`panel result-panel ${result.kind}`}>
-            <div className="section-heading"><div><span className="step">3</span><h2>Result</h2></div></div>
+            <div className="section-heading"><div><span className="step">{hasReference ? '4' : '3'}</span><h2>Result</h2></div></div>
             {result.kind === 'success' ? <>
               <div className="result-value">{pretty(result.value)}</div>
               <div className="result-unit">{unitLabel(analyte, toUnit)}</div>
@@ -258,19 +362,21 @@ export default function App() {
 
               {result.mode === 'special' && result.note ? <p className="rule-note">{result.note}</p> : null}
             </> : result.kind === 'error' ? <div className="error-box"><strong>Conversion unavailable</strong><p>{result.message}</p></div> : <div className="empty-state">Enter a numeric value and valid units to calculate.</div>}
+
+            {renderReferenceCard()}
             {analyte.note ? <p className="clinical-note">{analyte.note}</p> : null}
           </aside>
         </section>
 
         <section className="principles">
-          <div><strong>UCUM when appropriate</strong><span>Ordinary unit scaling and dimensional conversions remain on the NLM UCUM engine.</span></div>
-          <div><strong>Published special rules</strong><span>BUN, triglycerides, HbA1c and urine creatinine ratios are routed through explicit formulas with visible sources.</span></div>
-          <div><strong>No silent guessing</strong><span>D-dimer FEU↔DDU and other assay-dependent conventions stay excluded until a clearly scoped rule is added.</span></div>
+          <div><strong>Source-aware RI</strong><span>Reference intervals are stored with age, sex, specimen, method notes and source instead of being presented as universal normal ranges.</span></div>
+          <div><strong>Unit-aware comparison</strong><span>The published interval is converted into the selected output unit before Low / Within / High classification.</span></div>
+          <div><strong>No extrapolation</strong><span>If age, sex, method scope or analyte data do not match, LabTools shows no classification rather than inventing a range.</span></div>
         </section>
 
-        <section className="notice"><strong>Clinical-use note.</strong> This is an engineering prototype. Independently validate conversion results before use in reporting or patient care. Reference intervals remain separate because they are method-, population-, age-, and sex-dependent.</section>
+        <section className="notice"><strong>Clinical-use note.</strong> This is an engineering prototype. RCPA harmonised intervals apply only in their published context and do not replace the reporting laboratory's validated reference interval. Independently validate both conversion and interval logic before use in reporting or patient care.</section>
       </main>
-      <footer>LabTools v0.3 · UCUM + explicit clinical conversion rules · Open source</footer>
+      <footer>LabTools v0.4 · UCUM + published conversion rules + source-aware RCPA adult reference intervals · Open source</footer>
     </div>
   )
 }
